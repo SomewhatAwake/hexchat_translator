@@ -16,9 +16,9 @@ crate-type = ["cdylib"]
 hexchat-api = "^0.3"
 #hexchat-api = { git = "https://github.com/ttappr/hexchat-api.git" }
 regex = "1.8.1"
+serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-ureq = { version = "2.0" }
-urlparse = "0.7"
+ureq = { version = "2.0", features = ["json"] }
 
 [profile.release]
 lto = true

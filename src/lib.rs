@@ -20,10 +20,8 @@
 //! * `/OFFLANG`  - Turns translation off in the current window.
 //!
 
-use regex::Regex;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::convert::From;
 use std::error::Error;
 use std::fmt;
 use std::format as fm;
@@ -38,6 +36,34 @@ use UserData::*;
 /// server. The unit is seconds.
 ///
 const TRANSLATION_SERVER_TIMEOUT: u64 = 5;
+
+/// DeepL API endpoint for translation
+const DEEPL_API_URL: &str = "https://api-free.deepl.com/v2/translate";
+
+/// DeepL API key - should be set via environment variable DEEPL_API_KEY
+/// You can get a free API key from https://www.deepl.com/pro-api
+fn get_deepl_api_key() -> Option<String> {
+    std::env::var("DEEPL_API_KEY").ok()
+}
+
+/// DeepL API request structure
+#[derive(Serialize)]
+struct DeepLRequest {
+    text: Vec<String>,
+    source_lang: Option<String>,
+    target_lang: String,
+}
+
+/// DeepL API response structure
+#[derive(Deserialize)]
+struct DeepLResponse {
+    translations: Vec<DeepLTranslation>,
+}
+
+#[derive(Deserialize)]
+struct DeepLTranslation {
+    text: String,
+}
 
 // Register the entry points of the plugin.
 //
@@ -313,7 +339,7 @@ fn try_on_cmd_lsay(hc        : &Hexchat,
             let mut emsg = None;
             let mut is_over_limit = false;
             
-            match google_translate_free(&strip_msg, &src_lang, &tgt_lang) {
+            match deepl_translate(&strip_msg, &src_lang, &tgt_lang) {
                 Ok(trans) => { 
                     msg  = trans;
                 },
@@ -405,7 +431,7 @@ fn try_on_recv_message(hc        : &Hexchat,
             let mut emsg = None;
             let mut is_over_limit = false;
             
-            match google_translate_free(&strip_msg, &tgt_lang, &src_lang) {
+            match deepl_translate(&strip_msg, &tgt_lang, &src_lang) {
                 Ok(trans) => { 
                     msg = trans;
                 },
@@ -447,8 +473,8 @@ fn try_on_recv_message(hc        : &Hexchat,
     }
 }
 
-/// Uses the free translation web service provided by Google to translate
-/// a chat text message to the desired target language.
+/// Uses the DeepL API service to translate a chat text message to the 
+/// desired target language.
 /// # Arguments
 /// * `text`    - The text to translate.
 /// * `source`  - The source language of the text.
@@ -458,152 +484,117 @@ fn try_on_recv_message(hc        : &Hexchat,
 ///   the translation failed. The error will contain an aggregate of 
 ///   descriptions for each problem encountered during translation.
 ///
-fn google_translate_free(text   : &str, 
-                         source : &str, 
-                         target : &str)
+fn deepl_translate(text   : &str, 
+                   source : &str, 
+                   target : &str)
 
     -> Result<String, TranslationError> 
 {
-    // Optimizing the regex and agent using lazy_static wouldn't noticeably
-    // improve performance for the user. Plus, static resources are very hard to
-    // thoroughly clean up for when the plugin is being unloaded/reloaded.
-    let expr  = Regex::new(r".+?(?:[.?!;|]+\s+|$)").unwrap();
+    let api_key = match get_deepl_api_key() {
+        Some(key) => key,
+        None => {
+            return Err(TranslationError::new(
+                text.to_string(),
+                "DeepL API key not found. Set DEEPL_API_KEY environment variable.".to_string(),
+                false
+            ));
+        }
+    };
+
     let agent = ureq::AgentBuilder::new()
                       .timeout_read(
                            Duration::from_secs(TRANSLATION_SERVER_TIMEOUT)
-                      ).build(); 
-                     
-    let mut translated = String::new();
-    let mut errors     = vec![];
-    let mut over_limit = false;
+                      ).build();
 
-    // The translation service won't translate past certain punctuation, so we
-    // break the message up into parts terminated by such punctuation and
-    // treat each one as a separate translation while piecing the results 
-    // together.
-    for m in expr.find_iter(text) {
-        let sentence = m.as_str();
+    // Convert language codes to DeepL format
+    let deepl_source = map_to_deepl_lang(source);
+    let deepl_target = map_to_deepl_lang(target);
 
-        match translate_single(sentence, &agent, source, target) {
-            Ok(trans) => {
-                translated.push_str(&trans);
-            },
-            Err(err)  => {
-                use SingleTranslationError as STE;
+    let request = DeepLRequest {
+        text: vec![text.to_string()],
+        source_lang: if deepl_source == "auto" { None } else { Some(deepl_source.to_string()) },
+        target_lang: deepl_target.to_string(),
+    };
 
-                let emsg = match err {
-                    STE::StaticError(s) => {
-                        s.to_string()
-                    },
-                    STE::DynamicError(s) => {
-                        s
-                    },
-                    STE::OverLimit(s) => {
-                        over_limit = true;
-                        s.to_string()
+    match agent
+        .post(DEEPL_API_URL)
+        .set("Authorization", &format!("DeepL-Auth-Key {}", api_key))
+        .set("Content-Type", "application/json")
+        .send_json(&request)
+    {
+        Ok(response) => {
+            match response.into_json::<DeepLResponse>() {
+                Ok(deepl_response) => {
+                    if let Some(translation) = deepl_response.translations.first() {
+                        Ok(translation.text.clone())
+                    } else {
+                        Err(TranslationError::new(
+                            text.to_string(),
+                            "No translation returned from DeepL API".to_string(),
+                            false
+                        ))
                     }
-                };
-                errors.push(emsg);
-                translated.push_str(sentence);
-            },
+                },
+                Err(err) => {
+                    Err(TranslationError::new(
+                        text.to_string(),
+                        format!("Failed to parse DeepL response: {}", err),
+                        false
+                    ))
+                }
+            }
+        },
+        Err(err) => {
+            let is_over_limit = match &err {
+                ureq::Error::Status(code, _) => *code == 403 || *code == 429,
+                _ => false,
+            };
+            
+            Err(TranslationError::new(
+                text.to_string(),
+                format!("DeepL API request failed: {}", err),
+                is_over_limit
+            ))
         }
     }
-    if !errors.is_empty() {
-        // Error will contain the partially translated text, deduplicated
-        // error messages, and indicate if the translation limit was reached.
-        errors.sort_unstable();
-        errors.dedup();
-        Err( TranslationError::new(translated, errors.join(" "), over_limit) )
-        
-    } else {
-        // Each sentence translated went successfully.
-        Ok( translated )
-    }
 }
 
-/// Represents errors encountered when doing a single translation. This
-/// error is generated by `translate_single()`.
-/// # Variants
-/// * `StaticError`  - A predicted error with a static error message.
-/// * `DynamicError` - A freeform text error for unexpected errors.
-/// * `OverLimit`    - Indicates that the translation server sent a response
-///                    saying the user has used up all their translations
-///                    in some amount of time.
-///
-#[derive(Debug, Clone)]
-enum SingleTranslationError {
-    StaticError  (&'static str),
-    DynamicError (String),
-    OverLimit    (&'static str),
-}
-impl From<&SingleTranslationError> for SingleTranslationError {
-    fn from(item: &SingleTranslationError) -> Self {
-        item.clone()
-    }
-}
-
-/// Translates a single phrase, or sentence - one without multiple clauses 
-/// separated by stop punctuation like a period.
-/// # Arguments
-/// * `sentence`    - The phrase to translate.
-/// * `agent`       - The network agent that will send the HTTPS GET.
-/// * `source`      - The source language to translate from.
-/// * `target`      - The target language to translate to.
-/// # Returns
-/// * A `Result` with either a `String` if the translation was successful; or
-///   a `SingleTranslationError` if not.
-///
-fn translate_single(sentence : &str, 
-                    agent    : &ureq::Agent,
-                    source   : &str,
-                    target   : &str) 
-
-    -> Result<String, SingleTranslationError>
-{
-    use SingleTranslationError::*;
-    use serde_json::Result as SResult;
-    #[inline]
-    fn parse_json(s: &str) -> SResult<Value> {
-        serde_json::from_str::<Value>(s)
-    }
-    static ERRORS: [SingleTranslationError; 4] = [
-        StaticError("URL message escaping failed."),
-        StaticError("Failed to get response from translation server."),
-        StaticError("Failed to get text for HTTP response body."),
-        StaticError("Received invalid response format from server."),
-    ];
-
-    let escaped = urlparse::quote(sentence, b"").map_err(|_| &ERRORS[0])?;
-    let url     = fm!("https://translate.googleapis.com/\
-                      translate_a/single\
-                      ?client=gtx\
-                      &sl={source_lang}\
-                      &tl={target_lang}\
-                      &dt=t&q={source_text}",
-                      source_lang = source,
-                      target_lang = target,
-                      source_text = escaped);
-                                    
-    let tr_rsp = agent.get(&url).call()         .map_err(|_| &ERRORS[1])?;
-    
-    if tr_rsp.status_text() == "OK" {
-    
-        let rsp_txt = tr_rsp.into_string()      .map_err(|_| &ERRORS[2])?;
-        let tr_json = parse_json(&rsp_txt)      .map_err(|_| &ERRORS[3])?;
-        let trans   = tr_json[0][0][0].as_str() .ok_or  (    &ERRORS[3])?;
-        
-        let mut trans = trans.to_string();
-        
-        if sentence.ends_with(' ') {
-            trans.push(' ');
-        }
-        Ok(trans)
-        
-    } else if tr_rsp.status() == 403 {
-        Err( OverLimit("Server translation limit reached.") )
-        
-    } else {
-        Err( DynamicError(tr_rsp.status_text().to_string()) )
+/// Maps language codes to DeepL-compatible format
+fn map_to_deepl_lang(lang: &str) -> &str {
+    match lang.to_lowercase().as_str() {
+        "zh" => "ZH",
+        "en" => "EN",
+        "de" => "DE",
+        "fr" => "FR",
+        "it" => "IT",
+        "ja" => "JA",
+        "es" => "ES",
+        "nl" => "NL",
+        "pl" => "PL",
+        "pt" => "PT",
+        "ru" => "RU",
+        "bg" => "BG",
+        "cs" => "CS",
+        "da" => "DA",
+        "el" => "EL",
+        "et" => "ET",
+        "fi" => "FI",
+        "hu" => "HU",
+        "id" => "ID",
+        "lv" => "LV",
+        "lt" => "LT",
+        "ro" => "RO",
+        "sk" => "SK",
+        "sl" => "SL",
+        "sv" => "SV",
+        "tr" => "TR",
+        "uk" => "UK",
+        "ar" => "AR",
+        "hi" => "HI",
+        "ko" => "KO",
+        "nb" => "NB",
+        "no" => "NB", // Map Norwegian to Norwegian Bokmål
+        _ => lang, // Return as-is for unknown languages
     }
 }
 
@@ -747,42 +738,19 @@ const LME_HELP     : &str = "/LME <message> - Sends a channel action \
 
 // A listing of all the supported langauges.
 
-const SUPPORTED_LANGUAGES: [(&str, &str); 105] = [
-    
-    ("Afrikaans",      "af"), ("Hmong",        "hmn"), ("Polish",       "pl"),
-    ("Albanian",       "sq"), ("Hungarian",     "hu"), ("Portuguese",   "pt"),
-    ("Amharic",        "am"), ("Icelandic",     "is"), ("Punjabi",      "pa"),
-    ("Arabic",         "ar"), ("Igbo",          "ig"), ("Romanian",     "ro"),
-    ("Armenian",       "hy"), ("Indonesian",    "id"), ("Russian",      "ru"),
-    ("Azeerbaijani",   "az"), ("Irish",         "ga"), ("Samoan",       "sm"),
-    ("Basque",         "eu"), ("Italian",       "it"), ("Scots_Gaelic", "gd"),
-    ("Belarusian",     "be"), ("Japanese",      "ja"), ("Serbian",      "sr"),
-    ("Bengali",        "bn"), ("Javanese",      "jw"), ("Sesotho",      "st"),
-    ("Bosnian",        "bs"), ("Kannada",       "kn"), ("Shona",        "sn"),
-    ("Bulgarian",      "bg"), ("Kazakh",        "kk"), ("Sindhi",       "sd"),
-    ("Catalan",        "ca"), ("Khmer",         "km"), ("Sinhala",      "si"),
-    ("Cebuano",       "ceb"), ("Korean",        "ko"), ("Slovak",       "sk"),
-    ("Chinese",        "zh"), ("Kurdish",       "ku"), ("Slovenian",    "sl"),
-    ("Corsican",       "co"), ("Kyrgyz",        "ky"), ("Somali",       "so"),
-    ("Croatian",       "hr"), ("Lao",           "lo"), ("Spanish",      "es"),
-    ("Czech",          "cs"), ("Latin",         "la"), ("Sundanese",    "su"),
-    ("Danish",         "da"), ("Latvian",       "lv"), ("Swahili",      "sw"),
-    ("Dutch",          "nl"), ("Lithuanian",    "lt"), ("Swedish",      "sv"),
-    ("English",        "en"), ("Luxembourgish", "lb"), ("Tagalog",      "tl"),
-    ("Esperanto",      "eo"), ("Macedonian",    "mk"), ("Tajik",        "tg"),
-    ("Estonian",       "et"), ("Malagasy",      "mg"), ("Tamil",        "ta"),
-    ("Finnish",        "fi"), ("Malay",         "ms"), ("Telugu",       "te"),
-    ("French",         "fr"), ("Malayalam",     "ml"), ("Thai",         "th"),
-    ("Frisian",        "fy"), ("Maltese",       "mt"), ("Turkish",      "tr"),
-    ("Galician",       "gl"), ("Maori",         "mi"), ("Ukrainian",    "uk"),
-    ("Georgian",       "ka"), ("Marathi",       "mr"), ("Urdu",         "ur"),
-    ("German",         "de"), ("Mongolian",     "mn"), ("Uzbek",        "uz"),
-    ("Greek",          "el"), ("Myanmar",       "my"), ("Vietnamese",   "vi"),
-    ("Gujarati",       "gu"), ("Nepali",        "ne"), ("Welsh",        "cy"),
-    ("Haitian_Creole", "ht"), ("Norwegian",     "no"), ("Xhosa",        "xh"),
-    ("Hausa",          "ha"), ("Nyanja",        "ny"), ("Yiddish",      "yi"),
-    ("Hawaiian",      "haw"), ("Pashto",        "ps"), ("Yoruba",       "yo"),
-    ("Hebrew",         "he"), ("Persian",       "fa"), ("Zulu",         "zu"),
-    ("Hindi",          "hi"), ("",              ""  ), ("",             ""  )];		
+/// Supported languages by DeepL API
+const SUPPORTED_LANGUAGES: [(&str, &str); 33] = [
+    ("Arabic",        "ar"), ("Bulgarian",     "bg"), ("Chinese",      "zh"),
+    ("Czech",         "cs"), ("Danish",        "da"), ("Dutch",        "nl"),
+    ("English",       "en"), ("Estonian",      "et"), ("Finnish",      "fi"),
+    ("French",        "fr"), ("German",        "de"), ("Greek",        "el"),
+    ("Hungarian",     "hu"), ("Indonesian",    "id"), ("Italian",      "it"),
+    ("Japanese",      "ja"), ("Korean",        "ko"), ("Latvian",      "lv"),
+    ("Lithuanian",    "lt"), ("Norwegian",     "nb"), ("Polish",       "pl"),
+    ("Portuguese",    "pt"), ("Romanian",      "ro"), ("Russian",      "ru"),
+    ("Slovak",        "sk"), ("Slovenian",     "sl"), ("Spanish",      "es"),
+    ("Swedish",       "sv"), ("Turkish",       "tr"), ("Ukrainian",    "uk"),
+    ("Hindi",         "hi"), ("Arabic",        "ar"), ("",             ""  )
+];		
 
     

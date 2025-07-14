@@ -13,13 +13,31 @@ below it.
 
 The plugin was implemented in Rust using a 
 [hexchat-api](https://crates.io/crates/hexchat-api)
-to the Hexchat Plugin Interface. The translations are provided by Google's
-free translation API. The number of translations per hour is limited, so 
-be careful not to enable translations on channels that have high volume of
-messages per unit time. One on one private conversations are unlikely to be
-interrupted, but fast main channel traffic can cause the service to rate
-limit the translations, and it can take an hour for it to become responsive 
-again.
+to the Hexchat Plugin Interface. The translations are provided by DeepL's
+API service. DeepL provides high-quality translations with a free tier
+that includes 500,000 characters per month.
+
+## Setup
+
+To use this plugin, you need to obtain a free DeepL API key:
+
+1. Visit [DeepL API Free](https://www.deepl.com/pro-api) and sign up for a free account
+2. Get your API authentication key from the account settings
+3. Set the environment variable `DEEPL_API_KEY` to your API key before starting Hexchat
+
+### Setting the Environment Variable
+
+**Windows:**
+```cmd
+setx DEEPL_API_KEY "your-deepl-api-key-here"
+```
+
+**Linux/macOS:**
+```bash
+export DEEPL_API_KEY="your-deepl-api-key-here"
+```
+
+You can also add the export line to your shell profile (`.bashrc`, `.zshrc`, etc.) to make it permanent.
 
 ## Hexchat Commands
 * `/LISTLANG` 
@@ -36,9 +54,9 @@ again.
 The help for these 
 can be accessed through the Hexchat "/HELP" command.
 
-This plugin is stable, but experimental. It interact's with Google's free 
-translation web service which generously limits the number of translations per 
-hour. 
+This plugin is stable, but experimental. It interacts with DeepL's 
+translation API service which provides high-quality translations with generous 
+rate limits on the free tier. 
 
 To add it to Hexchat, you can put the relevant binary in the "addons" 
 folder of your system's Hexchat config directory.
