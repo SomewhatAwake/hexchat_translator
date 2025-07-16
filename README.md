@@ -1,4 +1,4 @@
-
+[![Rust](https://github.com/SomewhatAwake/hexchat_translator/actions/workflows/rust.yml/badge.svg)](https://github.com/SomewhatAwake/hexchat_translator/actions/workflows/rust.yml)
 # Hexchat Translator
 
 This is a plugin to Hexchat that provides translated chat features enabling one 
